@@ -1,2 +1,2 @@
-adb_shell
-plyer
+dbus-python
+PyGObject
