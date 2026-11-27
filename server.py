@@ -32,6 +32,12 @@ active_notifications_lock = threading.Lock()
 MAX_ACTIVE_NOTIFICATIONS = 500
 MAX_VISITED_NOTIFICATIONS = 2000
 
+# Track native PC desktop notifications to detect duplicates
+pc_notifications = {}  # {(norm_title, norm_body): timestamp}
+pc_notifications_lock = threading.Lock()
+PC_NOTIF_TTL = 120  # seconds to keep PC notifications in cache
+_our_bus_name = None
+
 # Paramètres globaux modifiables via config.ini
 packages = set()
 interval = 10
@@ -43,6 +49,7 @@ SERPAPI_KEY = ""
 FETCH_ICONS = True
 OPEN_APP_ON_CLICK = True
 ONLY_NEW_NOTIFICATIONS = True
+SKIP_PC_DUPLICATES = True
 AUTO_RECONNECT = True
 ADB_ADDRESS = ""
 ADB_PORT = 5555
@@ -204,6 +211,110 @@ APP_NAMES_FR = {
     "com.uptodown": "Uptodown"
 }
 
+
+def _normalize_text(s):
+	"""Normalize text for comparison: lowercase, collapse whitespace."""
+	return re.sub(r'\s+', ' ', (s or '').strip().lower())
+
+
+def _record_pc_notification(sender, app_name, summary, body):
+	"""Record a notification sent by a native PC application."""
+	if sender == _our_bus_name:
+		return
+	title_n = _normalize_text(summary)
+	body_n = _normalize_text(body)
+	if not title_n and not body_n:
+		return
+	if DEBUG_MODE:
+		logger.info(f"[PC-MONITOR] Notification PC détectée: '{summary}' / '{body}' (app: {app_name})")
+	with pc_notifications_lock:
+		pc_notifications[(title_n, body_n)] = time.time()
+
+
+def _is_pc_duplicate(title, text):
+	"""Check if a similar notification was recently shown by a native PC app."""
+	title_n = _normalize_text(title)
+	body_n = _normalize_text(text)
+	if not title_n and not body_n:
+		return False
+	now = time.time()
+	with pc_notifications_lock:
+		# Purge expired entries
+		expired = [k for k, ts in pc_notifications.items() if now - ts > PC_NOTIF_TTL]
+		for k in expired:
+			del pc_notifications[k]
+		# Exact match
+		if (title_n, body_n) in pc_notifications:
+			return True
+		# Partial match: similar title and body is a substring (or vice versa)
+		for (pc_t, pc_b) in list(pc_notifications):
+			if title_n and pc_t and (title_n == pc_t or title_n in pc_t or pc_t in title_n):
+				if not body_n or not pc_b or body_n in pc_b or pc_b in body_n:
+					return True
+	return False
+
+
+def _start_pc_notification_monitor():
+	"""Watch native PC desktop notifications via dbus-monitor to detect duplicates."""
+	try:
+		proc = subprocess.Popen(
+			["dbus-monitor", "--session",
+			 "type='method_call',interface='org.freedesktop.Notifications',member='Notify'"],
+			stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1
+		)
+
+		state = 'idle'
+		string_args = []
+		sender = ""
+
+		for line in iter(proc.stdout.readline, ''):
+			line = line.rstrip('\n\r')
+
+			# Detect start of a Notify method call
+			if (line.startswith('method call')
+					and 'member=Notify' in line
+					and 'org.freedesktop.Notifications' in line):
+				# Finalize previous call if still pending
+				if state == 'reading_args' and len(string_args) >= 4:
+					_record_pc_notification(sender, string_args[0],
+						string_args[2], string_args[3])
+				state = 'reading_args'
+				string_args = []
+				m = re.search(r'sender=(\S+)', line)
+				sender = m.group(1) if m else ""
+				continue
+
+			if state != 'reading_args':
+				continue
+
+			# A new top-level message starts (not indented) -> finalize
+			if line and not line[0].isspace():
+				if len(string_args) >= 4:
+					_record_pc_notification(sender, string_args[0],
+						string_args[2], string_args[3])
+				state = 'idle'
+				continue
+
+			# Once we hit an array arg, all 5 simple args (s u s s s) have been read
+			if re.match(r'\s+array\s', line):
+				if len(string_args) >= 4:
+					_record_pc_notification(sender, string_args[0],
+						string_args[2], string_args[3])
+				state = 'idle'
+				continue
+
+			# Capture top-level string arguments
+			str_match = re.match(r'\s+string "(.*)"$', line)
+			if str_match:
+				string_args.append(str_match.group(1))
+
+	except FileNotFoundError:
+		logger.warning("[PC-MONITOR] dbus-monitor introuvable, détection des doublons PC désactivée.")
+	except Exception as e:
+		if DEBUG_MODE:
+			logger.error(f"[PC-MONITOR] Erreur : {e}")
+
+
 def _has_connected_adb_device():
 	result = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=3)
 	lines = result.stdout.strip().splitlines()[1:]
@@ -257,6 +368,12 @@ def main():
 	logger.info("Démarrage du script - Envoi des notifications...")
 	threading.Thread(target=start_dbus_listener, daemon=True).start()
 
+	global _our_bus_name
+	_our_bus_name = dbus.SessionBus().get_unique_name()
+	if SKIP_PC_DUPLICATES:
+		threading.Thread(target=_start_pc_notification_monitor, daemon=True).start()
+		logger.info("[PC-MONITOR] Surveillance des notifications PC activée.")
+
 	visited = set()
 	initial_baseline_pending = ONLY_NEW_NOTIFICATIONS
 
@@ -301,6 +418,11 @@ def main():
 						icon_path = ""
 				elif not FETCH_ICONS or not os.path.exists(icon_path):
 					icon_path = ""
+
+				if SKIP_PC_DUPLICATES and _is_pc_duplicate(title, text):
+					if DEBUG_MODE:
+						logger.info(f"[PC-DUP] Ignoré (doublon PC) -> '{title}' / '{text}'")
+					continue
 
 				send_interactive_notification(title, text, app_display_name, icon_path, pkg)
 
@@ -381,7 +503,7 @@ def filter_package_names(notifications):
 def parse_config():
 	global packages, interval, privkey, pubkey, SERPAPI_KEY, FETCH_ICONS
 	global OPEN_APP_ON_CLICK, SKIP_KEYWORDS, ONLY_NEW_NOTIFICATIONS
-	global AUTO_RECONNECT, ADB_ADDRESS, ADB_PORT
+	global AUTO_RECONNECT, ADB_ADDRESS, ADB_PORT, SKIP_PC_DUPLICATES
 
 	config = configparser.ConfigParser()
 	config_path = os.path.join(BASE_DIR, "config.ini")
@@ -411,6 +533,8 @@ def parse_config():
 		OPEN_APP_ON_CLICK = config.getboolean('config', 'open_app_on_click', fallback=True)
 	if config.has_option('config', 'only_new_notifications'):
 		ONLY_NEW_NOTIFICATIONS = config.getboolean('config', 'only_new_notifications', fallback=True)
+	if config.has_option('config', 'skip_pc_duplicates'):
+		SKIP_PC_DUPLICATES = config.getboolean('config', 'skip_pc_duplicates', fallback=True)
 	if config.has_option('config', 'skip_keywords'):
 		raw_skips = config.get('config', 'skip_keywords')
 		SKIP_KEYWORDS = [kw.strip().lower() for kw in raw_skips.split(",") if kw.strip()]
